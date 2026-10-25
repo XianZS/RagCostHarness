@@ -1,0 +1,137 @@
+# 运行手册
+
+> 目标：**一次跑对。** 每一步都有验收条件，验收不过就不要进入下一步。
+> 全部代码在 `RAG/experiment/` 下，数据与结果写在同级目录。
+
+## 文件
+
+| 文件 | 是否调用模型 | 作用 |
+|---|---|---|
+| `prepare_data.py` | ❌ | 下载并冻结语料与查询集，输出校验报告 |
+| `run_experiment.py` | ✅ | 主程序，支持 dry-run、limit、断点续跑 |
+| `score.py` | ❌ | 离线评分，可反复重跑 |
+
+**关键设计：模型输出逐条落盘，评分独立。评分规则改了就重跑 `score.py`，不用重新调模型。**
+
+---
+
+## 第 0 步：数据准备（约 1 分钟，不调模型）
+
+```bash
+cd "/Users/byqh/Desktop/Haitao Yang/综述/RAG/experiment"
+python3 prepare_data.py
+```
+
+**产出**：`data/corpus.jsonl`、`data/queries.jsonl`、`data/report.md`
+
+**验收条件**：`report.md` 里六项检查全部 PASS
+
+| 检查 | 不过说明什么 |
+|---|---|
+| V1 每查询有金标段落 | 数据字段解析错了 |
+| V2 金标段落都在语料中 | 语料合并有误 |
+| V3 答案非空 | 字段名不对 |
+| V4 题型至少两类、最大类 ≤70% | **题型偏斜，曲线会贴底** |
+| V5 问题无重复 | 采样有重叠 |
+| V6 语料远大于单次预算 | 语料太小，检索无意义 |
+
+**有 FAIL 就停下，把 `report.md` 贴给我。**
+
+---
+
+## 第 1 步：配置自检（秒级，不调模型）
+
+```bash
+python3 run_experiment.py --dry-run
+```
+
+**验收条件**：输出 `dry-run 通过：数据完整、预算可容纳文档、配置无冲突`
+
+---
+
+## 第 2 步：冒烟测试（约 1 分钟，3 题 × 3 策略 × 1 档）
+
+```bash
+python3 run_experiment.py --limit 3 --budgets 2048 --strategies s0_parametric,s1_full_context,s2_dense_topk
+```
+
+**验收条件**：看 `runs/results.jsonl` 里的原始输出，逐项确认
+
+```bash
+python3 -c "
+import json
+for l in open('runs/results.jsonl'):
+    r=json.loads(l)
+    print(r['strategy'], r['qid'])
+    print('  Q :', r['question'][:80])
+    print('  A :', repr(r['answer'][:120]))
+    print('  G :', r['answers'])
+    print('  tok:', r['prompt_tokens'], '/', r['budget'], ' violation:', r['violation'])
+"
+```
+
+**四项都要对**：
+
+| 看什么 | 不对的表现 | 后果 |
+|---|---|---|
+| **答案格式** | 模型在解释、复述问题、输出为空 | EM 全 0，但模型其实没答错 |
+| **金标对照** | 答案明显正确但与 gold 写法不同 | 评分低估 |
+| **prompt_tokens** | 明显小于预算的一半 | 预算没被利用，策略间可比性差 |
+| **violation** | 大量 true | 预算强制失效 |
+
+**这一步发现的问题最便宜**——只花 9 次调用。
+
+---
+
+## 第 3 步：小规模试跑（约 20–30 分钟，20 题 × 5 策略 × 3 档）
+
+```bash
+python3 run_experiment.py --limit 20
+python3 score.py
+```
+
+**验收条件**（看 `score.py` 的输出）：
+
+| 检查 | 通过标准 | 不过怎么办 |
+|---|---|---|
+| **曲线不是全 0** | 至少一个策略的 contains ≥ 30% | 模型太弱，换 3B 或 7B |
+| **曲线不是全 1** | 至少一个策略的 contains ≤ 80% | 题目太简单，加难度 |
+| **策略之间有差异** | 最高与最低策略相差 ≥ 10 个百分点 | 策略实现有 bug，或预算档位没拉开 |
+| **违规率** | 全部 ≤ 5% | 调小 `CHARS_PER_TOKEN` |
+| **预算利用率** | 中位数 ≥ 60% | 检索返回的文档太少 |
+| **分题型不塌** | 每类题至少有一行非零 | 某类题全错，检查提示是否适合该题型 |
+
+**任一条不过，把 `score.py` 的完整输出贴给我，先别跑全量。**
+
+---
+
+## 第 4 步：全量（约 2–3 小时，60 题 × 5 策略 × 3 档）
+
+```bash
+python3 run_experiment.py
+```
+
+**断点续跑**：中途断了直接重跑同一条命令，会自动跳过已完成的三元组。**不要删 `runs/results.jsonl`。**
+
+**观察进度**：每 10 条会打印一行，含速率与预计剩余分钟。
+
+---
+
+## 常见故障
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `x 连不上 Ollama` | 服务没起 | `ollama serve` |
+| `x 本机没有模型` | 没拉 | `ollama pull qwen2.5:1.5b-instruct` |
+| `x 缺少 data/corpus.jsonl` | 没跑第 0 步 | 先跑 `prepare_data.py` |
+| HotpotQA 下载失败 | datasets-server 波动 | 重试；或把报错贴我，换数据源 |
+| 单条调用失败 | 显存瞬时不足 | 程序会跳过该条并继续，重跑会补 |
+| 跑得异常慢 | 换页 | 关掉浏览器等占内存的程序 |
+
+---
+
+## 一次跑对的三个前提
+
+1. **第 2、3 步必须真的看原始输出**，不能只看汇总数字。汇总数字正常但答案格式错的情况很常见。
+2. **不要跳过 --limit 直接全量跑。** 全量的 2–3 小时里，前 15 分钟就能暴露的问题不值得等。
+3. **`runs/results.jsonl` 是唯一不可再生的资产。** 数据能重下、索引能重建、评分能重跑，只有 3,000 次模型调用的输出不能。**备份它。**

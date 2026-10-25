@@ -1,0 +1,12 @@
+# 实验产物备份（可由 results.jsonl 重算，体积大）
+runs/*.bak
+
+# Python
+__pycache__/
+*.pyc
+
+# 日志
+*.log
+
+# macOS
+.DS_Store
